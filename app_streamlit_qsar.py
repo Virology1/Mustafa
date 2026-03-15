@@ -1,178 +1,498 @@
-import traceback
-import streamlit as st
+import io
+import os
+import zipfile
+import tempfile
+import warnings
+from dataclasses import dataclass
+from typing import Dict, List, Any
+
+import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
-from qsar_core_streamlit import QSARConfig, run_qsar_workflow
+from sklearn.base import clone
+from sklearn.model_selection import KFold, GridSearchCV, cross_val_predict
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
-st.set_page_config(page_title="QSAR Dashboard", page_icon="🧪", layout="wide")
+from sklearn.linear_model import Ridge, ElasticNet
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor
 
-st.title("🧪 QSAR Prediction Dashboard")
-st.write(
-    "Upload a training Excel file and a prediction Excel file, map the required columns, and generate "
-    "the same QSAR outputs produced by your Python workflow."
-)
+from rdkit import Chem
+from rdkit.Chem import Descriptors, Lipinski, Crippen, rdMolDescriptors, AllChem, DataStructs
 
-with st.expander("Expected input format", expanded=False):
-    st.markdown(
-        """
-**Training file** needs columns for:
-- compound name
-- SMILES
-- IC50 in µM
+warnings.filterwarnings("ignore")
 
-**Prediction file** needs columns for:
-- compound name
-- SMILES
+RANDOM_STATE = 42
 
-Both files can be `.xlsx` workbooks. You can choose the sheet index and map the column names below.
-        """
+
+@dataclass
+class QSARConfig:
+    train_sheet: int = 0
+    predict_sheet: int = 0
+    train_smiles_col: str = "SMILES"
+    train_target_col: str = "IC50_uM"
+    train_name_col: str = "Compound"
+    predict_smiles_col: str = "SMILES"
+    predict_name_col: str = "Compound Name"
+
+
+def ic50_uM_to_pIC50(ic50_uM):
+    ic50_uM = np.asarray(ic50_uM, dtype=float)
+    return 6.0 - np.log10(ic50_uM)
+
+
+def pIC50_to_ic50_uM(pic50):
+    pic50 = np.asarray(pic50, dtype=float)
+    return 10 ** (6.0 - pic50)
+
+
+def rmse(y_true, y_pred):
+    return np.sqrt(mean_squared_error(y_true, y_pred))
+
+
+def canonicalize_smiles(smiles):
+    if pd.isna(smiles):
+        return None
+    mol = Chem.MolFromSmiles(str(smiles))
+    if mol is None:
+        return None
+    return Chem.MolToSmiles(mol)
+
+
+def compute_rdkit_descriptors(smiles):
+    mol = Chem.MolFromSmiles(str(smiles))
+    if mol is None:
+        return None
+    return {
+        "MolWt": Descriptors.MolWt(mol),
+        "MolLogP": Crippen.MolLogP(mol),
+        "TPSA": rdMolDescriptors.CalcTPSA(mol),
+        "HeavyAtomCount": Lipinski.HeavyAtomCount(mol),
+        "NumHDonors": Lipinski.NumHDonors(mol),
+        "NumHAcceptors": Lipinski.NumHAcceptors(mol),
+        "NumRotatableBonds": Lipinski.NumRotatableBonds(mol),
+        "RingCount": Lipinski.RingCount(mol),
+        "FractionCSP3": rdMolDescriptors.CalcFractionCSP3(mol),
+        "ExactMolWt": rdMolDescriptors.CalcExactMolWt(mol),
+        "NumValenceElectrons": Descriptors.NumValenceElectrons(mol),
+        "NumHeteroatoms": Lipinski.NumHeteroatoms(mol),
+        "NHOHCount": Lipinski.NHOHCount(mol),
+        "NOCount": Lipinski.NOCount(mol),
+        "NumAliphaticRings": rdMolDescriptors.CalcNumAliphaticRings(mol),
+        "NumAromaticRings": rdMolDescriptors.CalcNumAromaticRings(mol),
+        "NumSaturatedRings": rdMolDescriptors.CalcNumSaturatedRings(mol),
+        "LabuteASA": rdMolDescriptors.CalcLabuteASA(mol),
+        "BalabanJ": Descriptors.BalabanJ(mol),
+        "BertzCT": Descriptors.BertzCT(mol),
+        "Chi0v": Descriptors.Chi0v(mol),
+        "Chi1v": Descriptors.Chi1v(mol),
+        "Chi2v": Descriptors.Chi2v(mol),
+        "Kappa1": Descriptors.Kappa1(mol),
+        "Kappa2": Descriptors.Kappa2(mol),
+        "Kappa3": Descriptors.Kappa3(mol),
+    }
+
+
+def build_feature_table(df, smiles_col):
+    rows, valid_idx = [], []
+    for idx, smi in df[smiles_col].items():
+        desc = compute_rdkit_descriptors(smi)
+        if desc is None:
+            continue
+        rows.append(desc)
+        valid_idx.append(idx)
+
+    if not rows:
+        return pd.DataFrame(), []
+
+    X_desc = pd.DataFrame(rows, index=valid_idx)
+    return X_desc, valid_idx
+
+
+def get_light_model_space():
+    return {
+        "Ridge": (
+            Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+                ("model", Ridge())
+            ]),
+            {"model__alpha": [0.1, 1.0, 10.0]}
+        ),
+        "ElasticNet": (
+            Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+                ("model", ElasticNet(max_iter=10000, random_state=RANDOM_STATE))
+            ]),
+            {"model__alpha": [0.001, 0.01, 0.1], "model__l1_ratio": [0.2, 0.5, 0.8]}
+        ),
+        "SVR_rbf": (
+            Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+                ("model", SVR(kernel="rbf"))
+            ]),
+            {
+                "model__C": [1, 10],
+                "model__gamma": ["scale", 0.1],
+                "model__epsilon": [0.05, 0.1],
+            }
+        ),
+        "RandomForest": (
+            Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("model", RandomForestRegressor(random_state=RANDOM_STATE))
+            ]),
+            {
+                "model__n_estimators": [100, 200],
+                "model__max_depth": [None, 5],
+                "model__min_samples_leaf": [1, 2],
+            }
+        ),
+        "ExtraTrees": (
+            Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("model", ExtraTreesRegressor(random_state=RANDOM_STATE))
+            ]),
+            {
+                "model__n_estimators": [100, 200],
+                "model__max_depth": [None, 5],
+                "model__min_samples_leaf": [1, 2],
+            }
+        ),
+    }
+
+
+def _choose_n_splits(n_samples: int) -> int:
+    if n_samples < 6:
+        raise ValueError("At least 6 unique valid training compounds are required.")
+    return min(5, n_samples)
+
+
+def benchmark_models_cv(X, y, model_space):
+    n_splits = _choose_n_splits(len(X))
+    outer_cv = KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+    inner_cv = KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+
+    results = []
+    predictions = {}
+
+    for model_name, (pipe, param_grid) in model_space.items():
+        grid = GridSearchCV(
+            estimator=clone(pipe),
+            param_grid=param_grid,
+            scoring="neg_root_mean_squared_error",
+            cv=inner_cv,
+            n_jobs=1,
+        )
+
+        y_pred = cross_val_predict(grid, X, y, cv=outer_cv, n_jobs=1)
+        grid.fit(X, y)
+
+        results.append({
+            "Model": model_name,
+            "CV_RMSE_pIC50": rmse(y, y_pred),
+            "CV_MAE_pIC50": mean_absolute_error(y, y_pred),
+            "CV_R2_pIC50": r2_score(y, y_pred),
+            "Best_Params": str(grid.best_params_),
+        })
+        predictions[model_name] = pd.DataFrame({"Observed_pIC50": y, "Predicted_pIC50": y_pred})
+
+    res_df = pd.DataFrame(results).sort_values(by="CV_RMSE_pIC50", ascending=True).reset_index(drop=True)
+    return res_df, predictions
+
+
+def fit_best_model(X, y, best_model_name, model_space):
+    n_splits = _choose_n_splits(len(X))
+    inner_cv = KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+    pipe, param_grid = model_space[best_model_name]
+    grid = GridSearchCV(
+        estimator=clone(pipe),
+        param_grid=param_grid,
+        scoring="neg_root_mean_squared_error",
+        cv=inner_cv,
+        n_jobs=1,
+    )
+    grid.fit(X, y)
+    return grid.best_estimator_, grid.best_params_
+
+
+def max_tanimoto_to_training(train_smiles, query_smiles):
+    train_fps = []
+    for smi in train_smiles:
+        mol = Chem.MolFromSmiles(str(smi))
+        if mol is not None:
+            train_fps.append(AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=512))
+
+    vals = []
+    for smi in query_smiles:
+        mol = Chem.MolFromSmiles(str(smi))
+        if mol is None or len(train_fps) == 0:
+            vals.append(np.nan)
+            continue
+        qfp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=512)
+        sims = DataStructs.BulkTanimotoSimilarity(qfp, train_fps)
+        vals.append(float(np.max(sims)))
+    return vals
+
+
+def confidence_flag(sim):
+    if pd.isna(sim):
+        return "Unknown"
+    if sim >= 0.60:
+        return "Higher confidence"
+    if sim >= 0.40:
+        return "Moderate confidence"
+    return "Low confidence"
+
+
+def load_excel_from_upload(uploaded_file, sheet=0):
+    uploaded_file.seek(0)
+    return pd.read_excel(uploaded_file, sheet_name=sheet)
+
+
+def validate_required_columns(df: pd.DataFrame, required_columns: List[str], label: str):
+    missing = [c for c in required_columns if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in {label}: {missing}. Available columns: {list(df.columns)}")
+
+
+def run_qsar_workflow(training_file, predict_file, config: QSARConfig, progress_callback=None) -> Dict[str, Any]:
+    if progress_callback:
+        progress_callback(5, "Reading uploaded Excel files...")
+    train_df = load_excel_from_upload(training_file, config.train_sheet)
+    pred_df = load_excel_from_upload(predict_file, config.predict_sheet)
+
+    validate_required_columns(train_df, [config.train_name_col, config.train_target_col, config.train_smiles_col], "training file")
+    validate_required_columns(pred_df, [config.predict_name_col, config.predict_smiles_col], "prediction file")
+
+    train_df = train_df[[config.train_name_col, config.train_target_col, config.train_smiles_col]].copy()
+    pred_df = pred_df[[config.predict_name_col, config.predict_smiles_col]].copy()
+
+    if progress_callback:
+        progress_callback(15, "Cleaning structures and target values...")
+    train_df = train_df.dropna(subset=[config.train_smiles_col, config.train_target_col]).copy()
+    pred_df = pred_df.dropna(subset=[config.predict_smiles_col]).copy()
+
+    train_df["Canonical_SMILES"] = train_df[config.train_smiles_col].apply(canonicalize_smiles)
+    pred_df["Canonical_SMILES"] = pred_df[config.predict_smiles_col].apply(canonicalize_smiles)
+
+    invalid_train = int(train_df["Canonical_SMILES"].isna().sum())
+    invalid_pred = int(pred_df["Canonical_SMILES"].isna().sum())
+
+    train_df = train_df.dropna(subset=["Canonical_SMILES"]).copy()
+    pred_df = pred_df.dropna(subset=["Canonical_SMILES"]).copy()
+
+    if train_df.empty:
+        raise ValueError("No valid training SMILES remained after cleaning.")
+    if pred_df.empty:
+        raise ValueError("No valid prediction SMILES remained after cleaning.")
+
+    if (pd.to_numeric(train_df[config.train_target_col], errors="coerce") <= 0).any():
+        raise ValueError("All IC50 values in the training set must be > 0 for pIC50 conversion.")
+
+    train_df[config.train_target_col] = pd.to_numeric(train_df[config.train_target_col], errors="coerce")
+    train_df = train_df.dropna(subset=[config.train_target_col]).copy()
+    train_df["pIC50"] = ic50_uM_to_pIC50(train_df[config.train_target_col].values)
+
+    before_dups = len(train_df)
+    train_df = train_df.drop_duplicates(subset=["Canonical_SMILES"]).reset_index(drop=True)
+    removed_dups = before_dups - len(train_df)
+
+    if len(train_df) < 6:
+        raise ValueError("At least 6 unique valid training compounds are recommended for this workflow.")
+
+    if progress_callback:
+        progress_callback(30, "Calculating descriptors...")
+    X_train_desc, valid_train_idx = build_feature_table(train_df, "Canonical_SMILES")
+    train_df = train_df.loc[valid_train_idx].reset_index(drop=True)
+    X_train_desc = X_train_desc.reset_index(drop=True)
+
+    X_pred_desc, valid_pred_idx = build_feature_table(pred_df, "Canonical_SMILES")
+    pred_df = pred_df.loc[valid_pred_idx].reset_index(drop=True)
+    X_pred_desc = X_pred_desc.reset_index(drop=True)
+
+    if X_train_desc.empty or X_pred_desc.empty:
+        raise ValueError("Descriptor generation failed for one or both uploaded datasets.")
+
+    y = train_df["pIC50"].reset_index(drop=True)
+
+    summary_df = pd.DataFrame({
+        "Metric": [
+            "Number_of_training_compounds",
+            "Number_of_prediction_compounds",
+            "Removed_duplicate_training_structures",
+            "Invalid_training_smiles_removed",
+            "Invalid_prediction_smiles_removed",
+            "Min_IC50_uM",
+            "Max_IC50_uM",
+            "Min_pIC50",
+            "Max_pIC50",
+            "Median_pIC50",
+        ],
+        "Value": [
+            len(train_df),
+            len(pred_df),
+            removed_dups,
+            invalid_train,
+            invalid_pred,
+            float(train_df[config.train_target_col].min()),
+            float(train_df[config.train_target_col].max()),
+            float(train_df["pIC50"].min()),
+            float(train_df["pIC50"].max()),
+            float(train_df["pIC50"].median()),
+        ],
+    })
+
+    if progress_callback:
+        progress_callback(45, "Running lightweight 5-fold CV model benchmarking...")
+    model_space = get_light_model_space()
+    model_results_df, cv_predictions = benchmark_models_cv(X_train_desc, y, model_space)
+
+    best_model_name = model_results_df.iloc[0]["Model"]
+    if progress_callback:
+        progress_callback(75, f"Refitting best model: {best_model_name}...")
+    best_model, best_params = fit_best_model(X_train_desc, y, best_model_name, model_space)
+    best_model.fit(X_train_desc, y)
+
+    train_df["Fitted_pIC50"] = best_model.predict(X_train_desc)
+    train_df["Fitted_IC50_uM"] = pIC50_to_ic50_uM(train_df["Fitted_pIC50"])
+
+    pred_df["Predicted_pIC50"] = best_model.predict(X_pred_desc)
+    pred_df["Predicted_IC50_uM"] = pIC50_to_ic50_uM(pred_df["Predicted_pIC50"])
+    pred_df["Max_Tanimoto_to_Training"] = max_tanimoto_to_training(
+        train_df["Canonical_SMILES"].tolist(), pred_df["Canonical_SMILES"].tolist()
+    )
+    pred_df["Prediction_Confidence"] = pred_df["Max_Tanimoto_to_Training"].apply(confidence_flag)
+    pred_df = pred_df.sort_values(by="Predicted_pIC50", ascending=False).reset_index(drop=True)
+
+    if progress_callback:
+        progress_callback(85, "Building Excel, CSV, and PNG outputs...")
+    outputs = build_output_files(
+        summary_df=summary_df,
+        model_results_df=model_results_df,
+        train_df=train_df,
+        pred_df=pred_df,
+        cv_predictions=cv_predictions,
+        X_train_desc=X_train_desc,
+        X_pred_desc=X_pred_desc,
+        best_model_name=best_model_name,
+        best_params=best_params,
+        predict_name_col=config.predict_name_col,
     )
 
-col_left, col_right = st.columns(2)
-with col_left:
-    training_file = st.file_uploader("Upload training_set.xlsx", type=["xlsx"], key="train")
-with col_right:
-    prediction_file = st.file_uploader("Upload dataset.xlsx", type=["xlsx"], key="pred")
+    if progress_callback:
+        progress_callback(100, "Finished.")
+    return {
+        "summary_df": summary_df,
+        "model_results_df": model_results_df,
+        "train_df": train_df,
+        "pred_df": pred_df,
+        "cv_predictions": cv_predictions,
+        "best_model_name": best_model_name,
+        "best_params": best_params,
+        "outputs": outputs,
+    }
 
-if training_file:
-    try:
-        preview_train = pd.read_excel(training_file, sheet_name=0)
-        training_file.seek(0)
-    except Exception as e:
-        preview_train = None
-        st.error(f"Could not read training file: {e}")
-else:
-    preview_train = None
 
-if prediction_file:
-    try:
-        preview_pred = pd.read_excel(prediction_file, sheet_name=0)
-        prediction_file.seek(0)
-    except Exception as e:
-        preview_pred = None
-        st.error(f"Could not read prediction file: {e}")
-else:
-    preview_pred = None
+def build_output_files(summary_df, model_results_df, train_df, pred_df, cv_predictions,
+                       X_train_desc, X_pred_desc, best_model_name, best_params, predict_name_col):
+    temp_dir = tempfile.mkdtemp(prefix="qsar_streamlit_light_")
+    excel_path = os.path.join(temp_dir, "QSAR_PLA_IC50_Predictions.xlsx")
+    model_csv = os.path.join(temp_dir, "model_comparison_5foldcv.csv")
+    summary_csv = os.path.join(temp_dir, "dataset_summary.csv")
+    train_csv = os.path.join(temp_dir, "training_set_with_fitted_values.csv")
+    pred_csv = os.path.join(temp_dir, "gcms_predictions_ranked.csv")
 
-with st.sidebar:
-    st.header("Settings")
-    train_sheet = st.number_input("Training sheet index", min_value=0, value=0, step=1)
-    predict_sheet = st.number_input("Prediction sheet index", min_value=0, value=0, step=1)
+    model_results_df.to_csv(model_csv, index=False)
+    summary_df.to_csv(summary_csv, index=False)
+    train_df.to_csv(train_csv, index=False)
+    pred_df.to_csv(pred_csv, index=False)
 
-    if preview_train is not None:
-        train_cols = list(preview_train.columns)
-        train_name_col = st.selectbox("Training compound name column", train_cols, index=train_cols.index("Compound") if "Compound" in train_cols else 0)
-        train_smiles_col = st.selectbox("Training SMILES column", train_cols, index=train_cols.index("SMILES") if "SMILES" in train_cols else 0)
-        train_target_col = st.selectbox("Training IC50 (µM) column", train_cols, index=train_cols.index("IC50_uM") if "IC50_uM" in train_cols else 0)
-    else:
-        train_name_col = st.text_input("Training compound name column", value="Compound")
-        train_smiles_col = st.text_input("Training SMILES column", value="SMILES")
-        train_target_col = st.text_input("Training IC50 (µM) column", value="IC50_uM")
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, sheet_name="Dataset_Summary", index=False)
+        model_results_df.to_excel(writer, sheet_name="Model_Comparison", index=False)
+        train_df.to_excel(writer, sheet_name="Training_Fit", index=False)
+        pred_df.to_excel(writer, sheet_name="Predictions", index=False)
+        for model_name, df_pred in cv_predictions.items():
+            df_pred.to_excel(writer, sheet_name=model_name[:31], index=False)
+        X_train_desc.to_excel(writer, sheet_name="Train_Descriptors", index=False)
+        X_pred_desc.to_excel(writer, sheet_name="Predict_Descriptors", index=False)
+        pd.DataFrame({"Best_Model": [best_model_name], "Best_Params": [str(best_params)]}).to_excel(
+            writer, sheet_name="Best_Model", index=False
+        )
 
-    if preview_pred is not None:
-        pred_cols = list(preview_pred.columns)
-        predict_name_col = st.selectbox("Prediction compound name column", pred_cols, index=pred_cols.index("Compound Name") if "Compound Name" in pred_cols else 0)
-        predict_smiles_col = st.selectbox("Prediction SMILES column", pred_cols, index=pred_cols.index("SMILES") if "SMILES" in pred_cols else 0)
-    else:
-        predict_name_col = st.text_input("Prediction compound name column", value="Compound Name")
-        predict_smiles_col = st.text_input("Prediction SMILES column", value="SMILES")
+    png_paths = plot_outputs(temp_dir, model_results_df, train_df, pred_df, best_model_name, predict_name_col)
 
-run_clicked = st.button("Run QSAR workflow", type="primary", use_container_width=True)
+    files = {
+        "QSAR_PLA_IC50_Predictions.xlsx": excel_path,
+        "model_comparison_5foldcv.csv": model_csv,
+        "dataset_summary.csv": summary_csv,
+        "training_set_with_fitted_values.csv": train_csv,
+        "gcms_predictions_ranked.csv": pred_csv,
+    }
+    files.update({os.path.basename(p): p for p in png_paths})
 
-if preview_train is not None:
-    st.subheader("Training file preview")
-    st.dataframe(preview_train.head(10), use_container_width=True)
+    zip_path = os.path.join(temp_dir, "qsar_output_bundle.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, path in files.items():
+            zf.write(path, arcname=name)
+    files["qsar_output_bundle.zip"] = zip_path
 
-if preview_pred is not None:
-    st.subheader("Prediction file preview")
-    st.dataframe(preview_pred.head(10), use_container_width=True)
+    file_bytes = {}
+    for name, path in files.items():
+        with open(path, "rb") as f:
+            file_bytes[name] = f.read()
 
-if run_clicked:
-    if not training_file or not prediction_file:
-        st.error("Please upload both the training and prediction Excel files.")
-    else:
-        progress_bar = st.progress(0)
-        status = st.empty()
+    return {"dir": temp_dir, "paths": files, "bytes": file_bytes}
 
-        def progress_callback(percent, message):
-            progress_bar.progress(int(percent))
-            status.info(message)
 
-        try:
-            config = QSARConfig(
-                train_sheet=int(train_sheet),
-                predict_sheet=int(predict_sheet),
-                train_smiles_col=train_smiles_col,
-                train_target_col=train_target_col,
-                train_name_col=train_name_col,
-                predict_smiles_col=predict_smiles_col,
-                predict_name_col=predict_name_col,
-            )
+def plot_outputs(temp_dir, model_results_df, train_df, pred_df, best_model_name, predict_name_col):
+    out = []
 
-            results = run_qsar_workflow(training_file, prediction_file, config, progress_callback=progress_callback)
-            status.success("QSAR workflow completed successfully.")
+    p1 = os.path.join(temp_dir, "model_comparison_rmse.png")
+    plt.figure(figsize=(8, 5))
+    plt.bar(model_results_df["Model"], model_results_df["CV_RMSE_pIC50"])
+    plt.xticks(rotation=45, ha="right")
+    plt.ylabel("5-fold CV RMSE (pIC50)")
+    plt.title("QSAR model comparison")
+    plt.tight_layout()
+    plt.savefig(p1, dpi=300, bbox_inches="tight")
+    plt.close()
+    out.append(p1)
 
-            m1, m2, m3 = st.columns(3)
-            with m1:
-                st.metric("Best model", results["best_model_name"])
-            with m2:
-                st.metric("Training compounds", int(results["summary_df"].loc[results["summary_df"]["Metric"] == "Number_of_training_compounds", "Value"].iloc[0]))
-            with m3:
-                st.metric("Prediction compounds", int(results["summary_df"].loc[results["summary_df"]["Metric"] == "Number_of_prediction_compounds", "Value"].iloc[0]))
+    p2 = os.path.join(temp_dir, "observed_vs_fitted_best_model.png")
+    plt.figure(figsize=(6, 6))
+    plt.scatter(train_df["pIC50"], train_df["Fitted_pIC50"])
+    lims = [
+        min(train_df["pIC50"].min(), train_df["Fitted_pIC50"].min()) - 0.2,
+        max(train_df["pIC50"].max(), train_df["Fitted_pIC50"].max()) + 0.2,
+    ]
+    plt.plot(lims, lims, "--")
+    plt.xlim(lims)
+    plt.ylim(lims)
+    plt.xlabel("Observed pIC50")
+    plt.ylabel("Fitted pIC50")
+    plt.title(f"Observed vs fitted ({best_model_name})")
+    plt.tight_layout()
+    plt.savefig(p2, dpi=300, bbox_inches="tight")
+    plt.close()
+    out.append(p2)
 
-            st.subheader("Model comparison")
-            st.dataframe(results["model_results_df"], use_container_width=True)
+    p3 = os.path.join(temp_dir, "top_predicted_gcms_compounds.png")
+    top_n = min(20, len(pred_df))
+    plt.figure(figsize=(10, 6))
+    plt.barh(pred_df.loc[:top_n - 1, predict_name_col][::-1], pred_df.loc[:top_n - 1, "Predicted_pIC50"][::-1])
+    plt.xlabel("Predicted pIC50")
+    plt.title("Top predicted compounds")
+    plt.tight_layout()
+    plt.savefig(p3, dpi=300, bbox_inches="tight")
+    plt.close()
+    out.append(p3)
 
-            st.subheader("Top predicted compounds")
-            st.dataframe(results["pred_df"].head(20), use_container_width=True)
-
-            st.subheader("Dataset summary")
-            st.dataframe(results["summary_df"], use_container_width=True)
-
-            st.subheader("Plots")
-            pcol1, pcol2, pcol3 = st.columns(3)
-            with pcol1:
-                st.image(results["outputs"]["bytes"]["model_comparison_rmse.png"], caption="Model comparison RMSE")
-            with pcol2:
-                st.image(results["outputs"]["bytes"]["observed_vs_fitted_best_model.png"], caption="Observed vs fitted")
-            with pcol3:
-                st.image(results["outputs"]["bytes"]["top_predicted_gcms_compounds.png"], caption="Top predicted compounds")
-
-            st.subheader("Download outputs")
-            d1, d2 = st.columns(2)
-            with d1:
-                st.download_button(
-                    "Download full ZIP bundle",
-                    data=results["outputs"]["bytes"]["qsar_output_bundle.zip"],
-                    file_name="qsar_output_bundle.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                )
-            with d2:
-                st.download_button(
-                    "Download Excel workbook",
-                    data=results["outputs"]["bytes"]["QSAR_PLA_IC50_Predictions.xlsx"],
-                    file_name="QSAR_PLA_IC50_Predictions.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-
-            with st.expander("Download individual files", expanded=False):
-                for filename, file_bytes in results["outputs"]["bytes"].items():
-                    if filename == "qsar_output_bundle.zip":
-                        continue
-                    mime = "text/csv" if filename.endswith(".csv") else "image/png" if filename.endswith(".png") else "application/octet-stream"
-                    if filename.endswith(".xlsx"):
-                        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    st.download_button(
-                        f"Download {filename}",
-                        data=file_bytes,
-                        file_name=filename,
-                        mime=mime,
-                        key=f"download_{filename}",
-                    )
-
-        except Exception as e:
-            status.error("Workflow failed.")
-            st.error(str(e))
-            st.code(traceback.format_exc())
+    return out
